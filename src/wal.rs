@@ -58,7 +58,6 @@ use {
     cmp::{max, min},
     fs::{self, File, remove_file},
     io::{self, BufWriter, Read, Seek, SeekFrom, Write},
-    mem,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::Arc
@@ -80,6 +79,8 @@ const DEFAULT_MAX_SEGMENT_SIZE: SegmentSize = 16 * 1024; // = 16 KB.
 const DEFAULT_MAX_SEGMENT_COUNT: usize = 1000;
 
 const SEGMENT_NAME_PREFIX: &str = "segment-";
+
+const ENTRY_ENCODING_SIZE_SIZE: usize = 4;
 
 type SegmentID = u32;
 type SegmentSize = u64;
@@ -236,7 +237,7 @@ impl WAL {
                            crc: hash(&data),
                            data };
 
-    let mut buffer = Vec::with_capacity(4 + entry.encoded_len());
+    let mut buffer = Vec::with_capacity(ENTRY_ENCODING_SIZE_SIZE + entry.encoded_len());
 
     buffer.extend_from_slice(&(entry.encoded_len() as u32).to_le_bytes());
     entry.encode(&mut buffer)?;
@@ -343,6 +344,22 @@ fn get_segment_appender(dir: &Path, segment_id: SegmentID) -> io::Result<Segment
   Ok(segment_appender)
 }
 
+/// Expects that the segment reader in the beginning of some entry : which consists of the entry
+/// encoding size, followed by the actual entry encoding.
+/// Reads and returns the entry encoding size.
+/// The segment reader is seeked to the beginning of the entry encoding.
+fn read_entry_encoding_size(segment_reader: &mut File) -> io::Result<u32> {
+  // Read the entry encoding size.
+  let mut entry_encoding_size: [u8; ENTRY_ENCODING_SIZE_SIZE] = [0; ENTRY_ENCODING_SIZE_SIZE];
+  segment_reader.read_exact(&mut entry_encoding_size)?;
+  let entry_encoding_size = u32::from_le_bytes(entry_encoding_size);
+
+  // Seek the segment reader to the beginning of the entry encoding.
+  segment_reader.seek(SeekFrom::Current(ENTRY_ENCODING_SIZE_SIZE as i64))?;
+
+  Ok(entry_encoding_size)
+}
+
 /// Returns the last entry in the given segment.
 fn get_last_entry_in_segment(wal_dir: &Path, segment_id: SegmentID) -> Result<proto::WalEntry> {
   let segment_path = wal_dir.join(format!("{SEGMENT_NAME_PREFIX}{segment_id}"));
@@ -354,33 +371,20 @@ fn get_last_entry_in_segment(wal_dir: &Path, segment_id: SegmentID) -> Result<pr
   // Seek to the beginning of the file.
   segment_reader.seek(SeekFrom::Start(0))?;
 
-  let mut last_entry_encoding_size = 0;
+  let last_entry_encoding_size = 0;
 
   loop {
     // Get the current entry encoding size.
-    let mut current_entry_encoding_size: [u8; 4] = [0; 4];
-    match segment_reader.read_exact(&mut current_entry_encoding_size) {
-      // There are no entries left.
-      // So, we now have the last entry.
-      | Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
-
-      | Err(error) => return Err(error.into()),
-
-      | _ => {}
-    }
-    let current_entry_encoding_size = u32::from_le_bytes(current_entry_encoding_size);
-
-    segment_reader.seek(SeekFrom::Current(4))?;
+    let current_entry_encoding_size = read_entry_encoding_size(&mut segment_reader)?;
 
     // Check if this is the last entry.
     // When yes, we can break out of the loop.
 
-    let current_entry_ends_at =
-      segment_reader.stream_position()? + (4 + current_entry_encoding_size) as u64;
+    let current_entry_ends_at = segment_reader.stream_position()?
+                                + (ENTRY_ENCODING_SIZE_SIZE as u64
+                                   + current_entry_encoding_size as u64);
 
     if current_entry_ends_at == segment_size {
-      last_entry_encoding_size = current_entry_encoding_size;
-
       break;
     }
 
@@ -411,8 +415,7 @@ fn decode_entry(encoding: &[u8]) -> Result<WalEntry> {
 }
 
 pub struct WALReplayer<'wal_replayer> {
-  /// Write lock on the thread safe WAL.
-  thread_safe_wal: RwLockWriteGuard<'wal_replayer, WAL>,
+  wal: RwLockWriteGuard<'wal_replayer, WAL>,
 
   current_segment_id:     SegmentID,
   current_segment_reader: Option<File>
@@ -421,10 +424,10 @@ pub struct WALReplayer<'wal_replayer> {
 impl<'wal_replayer> WALReplayer<'wal_replayer> {
   /// Constructs an instance of the WAL replayer.
   /// We assume that a latest checkpoint already exists.
-  pub fn new(thread_safe_wal: RwLockWriteGuard<'wal_replayer, WAL>) -> Result<Self> {
+  pub fn new(wal: RwLockWriteGuard<'wal_replayer, WAL>) -> Result<Self> {
     // Read information about the latest checkpoint from the .checkpoint file.
 
-    let checkpoint_file_path = thread_safe_wal.dir.join(CHECKPOINT_FILE_NAME);
+    let checkpoint_file_path = wal.dir.join(CHECKPOINT_FILE_NAME);
     let latest_checkpoint_information = fs::read_to_string(checkpoint_file_path)?;
 
     let (current_segment_id, checkpoint_entry_lsn) =
@@ -438,8 +441,7 @@ impl<'wal_replayer> WALReplayer<'wal_replayer> {
 
     // Create the segment reader.
 
-    let current_segment_path =
-      thread_safe_wal.dir.join(format!("{SEGMENT_NAME_PREFIX}{current_segment_id}"));
+    let current_segment_path = wal.dir.join(format!("{SEGMENT_NAME_PREFIX}{current_segment_id}"));
 
     let mut current_segment_reader = File::options().read(true).open(current_segment_path)?;
 
@@ -448,12 +450,7 @@ impl<'wal_replayer> WALReplayer<'wal_replayer> {
     // And seek to the end of the entry which represents the latest checkpoint.
     loop {
       // Read the current entry encoding size.
-
-      let mut current_entry_encoding_size: [u8; 4] = [0; 4];
-      current_segment_reader.read_exact(&mut current_entry_encoding_size)?;
-      let current_entry_encoding_size = u32::from_le_bytes(current_entry_encoding_size);
-
-      current_segment_reader.seek(SeekFrom::Current(4))?;
+      let current_entry_encoding_size = read_entry_encoding_size(&mut current_segment_reader)?;
 
       // Read and decode the current entry encoding.
 
@@ -471,7 +468,7 @@ impl<'wal_replayer> WALReplayer<'wal_replayer> {
       }
     }
 
-    Ok(Self { thread_safe_wal,
+    Ok(Self { wal,
 
               current_segment_id,
               current_segment_reader: Some(current_segment_reader) })
@@ -500,7 +497,7 @@ impl<'wal_replayer> WALReplayer<'wal_replayer> {
       if seek_position == current_segment_size {
         let next_segment_id = self.current_segment_id + 1;
         let next_segment_path =
-          self.thread_safe_wal.dir.join(format!("{SEGMENT_NAME_PREFIX}{next_segment_id}"));
+          self.wal.dir.join(format!("{SEGMENT_NAME_PREFIX}{next_segment_id}"));
 
         let mut next_segment_reader = match File::options().read(true).open(next_segment_path) {
           // The next segment doesn't exist.
@@ -525,12 +522,7 @@ impl<'wal_replayer> WALReplayer<'wal_replayer> {
       // At this point, we're sure that there's an entry to be read in the current segment.
 
       // Read the current entry encoding size.
-
-      let mut current_entry_encoding_size: [u8; 4] = [0; 4];
-      current_segment_reader.read_exact(&mut current_entry_encoding_size)?;
-      let current_entry_encoding_size = u32::from_le_bytes(current_entry_encoding_size);
-
-      current_segment_reader.seek(SeekFrom::Current(4))?;
+      let current_entry_encoding_size = read_entry_encoding_size(current_segment_reader)?;
 
       // Read and decode the current entry encoding.
 
