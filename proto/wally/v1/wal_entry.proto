@@ -22,7 +22,7 @@
 
 syntax = "proto3";
 
-package dropdb_rusty.v1;
+package wally.v1;
 
 message WALEntry {
   uint32 lsn = 1;

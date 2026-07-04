@@ -1,5 +1,5 @@
 [package]
-name = "dropdb-rusty"
+name = "wally"
 version = "0.1.0"
 edition = "2024"
 
@@ -11,3 +11,6 @@ thiserror = "2.0.18"
 
 [build-dependencies]
 prost-build = "0.14.4"
+
+[dev-dependencies]
+tempfile = "3.27.0"

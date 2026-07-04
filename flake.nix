@@ -1,4 +1,6 @@
 {
+  description = "Wally development environment";
+
   inputs = {
     nixpkgs.url = "github:cachix/devenv-nixpkgs/rolling";
     systems.url = "github:nix-systems/default";
