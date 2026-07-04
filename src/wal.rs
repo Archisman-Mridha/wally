@@ -50,17 +50,8 @@ use {
   crate::{
     error::{Error, Result},
     wal::proto::WalEntry
-  },
-  crc32fast::hash,
-  parking_lot::{RwLock, RwLockWriteGuard},
-  prost::Message,
-  std::{
-    cmp::{max, min},
-    fs::{self, File, remove_file},
-    io::{self, BufWriter, Read, Seek, SeekFrom, Write},
-    os::unix::fs::MetadataExt,
-    path::{Path, PathBuf},
-    sync::Arc
+  }, crc32fast::hash, parking_lot::{RwLock, RwLockWriteGuard}, prost::Message, std::{
+    cmp::{max, min}, env::home_dir, fs::{self, File, remove_file}, io::{self, BufWriter, Read, Seek, SeekFrom, Write}, os::unix::fs::MetadataExt, path::{Path, PathBuf}, sync::Arc
   }
 };
 
@@ -70,8 +61,6 @@ mod proto {
 
   include!(concat!(env!("OUT_DIR"), "/dropdb_rusty.v1.rs"));
 }
-
-const DEFAULT_DIR: &str = "~/.dropdb-rusty/wal";
 
 const CHECKPOINT_FILE_NAME: &str = ".checkpoint";
 
@@ -130,7 +119,9 @@ pub struct WALOptions {
 
 impl Default for WALOptions {
   fn default() -> Self {
-    Self { dir: PathBuf::from(DEFAULT_DIR),
+    let dir = home_dir().unwrap_or("/".into()).join(".dropdb-rusty/wal");
+
+    Self { dir,
 
            max_segment_size:  DEFAULT_MAX_SEGMENT_SIZE,
            max_segment_count: DEFAULT_MAX_SEGMENT_COUNT }
@@ -255,9 +246,9 @@ impl WAL {
       let latest_checkpoint_information = format!("{}:{}", self.active_segment_id, entry.lsn);
 
       let mut checkpoint_file_updater =
-        File::options().write(true).truncate(true).open(&self.checkpoint_file_path)?;
+        File::options().create(true).write(true).truncate(true).open(&self.checkpoint_file_path)?;
 
-      checkpoint_file_updater.write(latest_checkpoint_information.as_bytes())?;
+      checkpoint_file_updater.write_all(latest_checkpoint_information.as_bytes())?;
 
       checkpoint_file_updater.sync_data()?;
     }
@@ -354,9 +345,6 @@ fn read_entry_encoding_size(segment_reader: &mut File) -> io::Result<u32> {
   segment_reader.read_exact(&mut entry_encoding_size)?;
   let entry_encoding_size = u32::from_le_bytes(entry_encoding_size);
 
-  // Seek the segment reader to the beginning of the entry encoding.
-  segment_reader.seek(SeekFrom::Current(ENTRY_ENCODING_SIZE_SIZE as i64))?;
-
   Ok(entry_encoding_size)
 }
 
@@ -371,29 +359,27 @@ fn get_last_entry_in_segment(wal_dir: &Path, segment_id: SegmentID) -> Result<pr
   // Seek to the beginning of the file.
   segment_reader.seek(SeekFrom::Start(0))?;
 
-  let last_entry_encoding_size = 0;
+  let mut last_entry_encoding_size: u32;
 
   loop {
     // Get the current entry encoding size.
-    let current_entry_encoding_size = read_entry_encoding_size(&mut segment_reader)?;
+    // This also seeks us to the beginning of the current entry's encoding.
+    last_entry_encoding_size = read_entry_encoding_size(&mut segment_reader)?;
 
     // Check if this is the last entry.
-    // When yes, we can break out of the loop.
-
-    let current_entry_ends_at = segment_reader.stream_position()?
-                                + (ENTRY_ENCODING_SIZE_SIZE as u64
-                                   + current_entry_encoding_size as u64);
-
+    // When yes, we can break out of the loop, with the reader positioned at the beginning of the
+    // last entry's encoding.
+    let current_entry_ends_at = segment_reader.stream_position()? + last_entry_encoding_size as u64;
     if current_entry_ends_at == segment_size {
       break;
     }
 
     // Otherwise, seek to the beginning of the next entry.
-    segment_reader.seek(SeekFrom::Current(current_entry_encoding_size as i64))?;
+    segment_reader.seek(SeekFrom::Current(last_entry_encoding_size as i64))?;
   }
 
   // Read the last entry's encoding.
-  let mut last_entry_encoding = Vec::with_capacity(last_entry_encoding_size as usize);
+  let mut last_entry_encoding = vec![0u8; last_entry_encoding_size as usize];
   segment_reader.read_exact(&mut last_entry_encoding)?;
 
   // Decode the last entry, and, verify it's data integrity.
@@ -406,7 +392,7 @@ fn decode_entry(encoding: &[u8]) -> Result<WalEntry> {
 
   // Verify data integrity.
 
-  let current_crc = crc32fast::hash(encoding);
+  let current_crc = hash(&entry.data);
   if current_crc != entry.crc {
     return Err(Error::CorruptedWALEntry { lsn: entry.lsn });
   }
@@ -414,20 +400,20 @@ fn decode_entry(encoding: &[u8]) -> Result<WalEntry> {
   Ok(entry)
 }
 
-pub struct WALReplayer<'wal_replayer> {
-  wal: RwLockWriteGuard<'wal_replayer, WAL>,
+pub struct WALReplayer {
+  dir: PathBuf,
 
   current_segment_id:     SegmentID,
   current_segment_reader: Option<File>
 }
 
-impl<'wal_replayer> WALReplayer<'wal_replayer> {
+impl WALReplayer {
   /// Constructs an instance of the WAL replayer.
   /// We assume that a latest checkpoint already exists.
-  pub fn new(wal: RwLockWriteGuard<'wal_replayer, WAL>) -> Result<Self> {
+  pub fn new(dir: PathBuf) -> Result<Self> {
     // Read information about the latest checkpoint from the .checkpoint file.
 
-    let checkpoint_file_path = wal.dir.join(CHECKPOINT_FILE_NAME);
+    let checkpoint_file_path = dir.join(CHECKPOINT_FILE_NAME);
     let latest_checkpoint_information = fs::read_to_string(checkpoint_file_path)?;
 
     let (current_segment_id, checkpoint_entry_lsn) =
@@ -441,7 +427,7 @@ impl<'wal_replayer> WALReplayer<'wal_replayer> {
 
     // Create the segment reader.
 
-    let current_segment_path = wal.dir.join(format!("{SEGMENT_NAME_PREFIX}{current_segment_id}"));
+    let current_segment_path = dir.join(format!("{SEGMENT_NAME_PREFIX}{current_segment_id}"));
 
     let mut current_segment_reader = File::options().read(true).open(current_segment_path)?;
 
@@ -454,12 +440,10 @@ impl<'wal_replayer> WALReplayer<'wal_replayer> {
 
       // Read and decode the current entry encoding.
 
-      let mut current_entry_encoding = Vec::with_capacity(current_entry_encoding_size as usize);
+      let mut current_entry_encoding = vec![0u8; current_entry_encoding_size as usize];
       current_segment_reader.read_exact(&mut current_entry_encoding)?;
 
       let current_entry = decode_entry(&current_entry_encoding)?;
-
-      current_segment_reader.seek(SeekFrom::Current(current_entry_encoding_size as i64))?;
 
       // That entry was the latest checkpoint.
       // So, we're done with seeking. And can start with replaying the WAL.
@@ -468,7 +452,7 @@ impl<'wal_replayer> WALReplayer<'wal_replayer> {
       }
     }
 
-    Ok(Self { wal,
+    Ok(Self { dir,
 
               current_segment_id,
               current_segment_reader: Some(current_segment_reader) })
@@ -497,7 +481,7 @@ impl<'wal_replayer> WALReplayer<'wal_replayer> {
       if seek_position == current_segment_size {
         let next_segment_id = self.current_segment_id + 1;
         let next_segment_path =
-          self.wal.dir.join(format!("{SEGMENT_NAME_PREFIX}{next_segment_id}"));
+          self.dir.join(format!("{SEGMENT_NAME_PREFIX}{next_segment_id}"));
 
         let mut next_segment_reader = match File::options().read(true).open(next_segment_path) {
           // The next segment doesn't exist.
@@ -526,12 +510,52 @@ impl<'wal_replayer> WALReplayer<'wal_replayer> {
 
       // Read and decode the current entry encoding.
 
-      let mut current_entry_encoding = Vec::with_capacity(current_entry_encoding_size as usize);
+      let mut current_entry_encoding = vec![0u8; current_entry_encoding_size as usize];
       current_segment_reader.read_exact(&mut current_entry_encoding)?;
 
       let current_entry = decode_entry(&current_entry_encoding)?;
 
       return Ok(Some(current_entry));
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn basic() -> Result<()> {
+    let dir = "./.dropdb-rusty/wal";
+
+    let mut wal = ThreadSafeWAL::new(WALOptions {
+      dir: dir.into(),
+      ..Default::default()
+    })?;
+
+    let entries = vec![("HELLO WORLD",    false),
+                       ("GOOD BYE",       true),
+                       ("WE'RE SO BACK",  false),];
+
+    for (data, checkpoint) in entries {
+      let data = data.as_bytes().to_vec();
+      match checkpoint {
+        | false => wal.write(data),
+        | true => wal.checkpoint(data)
+      }?;
+    }
+
+    drop(wal);
+
+    let mut wal_replayer = WALReplayer::new(dir.into())?;
+
+    let entry = wal_replayer.try_next()?.unwrap();
+    let data = String::from_utf8(entry.data).unwrap();
+
+    assert_eq!(data, "WE'RE SO BACK");
+
+    fs::remove_dir_all(dir)?;
+
+    Ok(())
   }
 }
