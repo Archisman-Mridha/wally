@@ -90,37 +90,6 @@ type SegmentID = u32;
 type SegmentSize = u64;
 type SegmentAppender = BufWriter<File>;
 
-pub struct ThreadSafeWAL(Arc<RwLock<WAL>>);
-
-pub struct WAL {
-  /// The directory where segments are stored.
-  dir: PathBuf,
-
-  /// Path to the .checkpoint file, where information about the latest checkpoint is stored in
-  /// this format : <segment ID>:<entry LSN>.
-  /// When empty, it indicates that there are no checkpoints.
-  checkpoint_file_path: PathBuf,
-
-  /// Maximum byte size a segment can grow to.
-  max_segment_size: SegmentSize,
-
-  /// Maximum number of segments there can be.
-  max_segment_count: usize,
-
-  /// ID of the oldest segment.
-  /// Lower the segment ID, older it is.
-  oldest_segment_id: SegmentID,
-
-  /// ID of the active segment, i.e., the segment to which entries will currently be appended.
-  active_segment_id: SegmentID,
-
-  /// Buffered writer to the active segment, used for appending entries.
-  active_segment_appender: BufWriter<File>,
-
-  /// LSN of the next entry to be appended.
-  next_entry_lsn: u32
-}
-
 pub struct WALOptions {
   /// The directory where segments are stored.
   dir: PathBuf,
@@ -142,6 +111,8 @@ impl Default for WALOptions {
            max_segment_count: DEFAULT_MAX_SEGMENT_COUNT }
   }
 }
+
+pub struct ThreadSafeWAL(Arc<RwLock<WAL>>);
 
 impl ThreadSafeWAL {
   pub fn new(options: WALOptions) -> Result<Self> {
@@ -221,6 +192,35 @@ impl ThreadSafeWAL {
     let mut wal = self.0.write();
     wal.write_entry(data, true)
   }
+}
+
+pub struct WAL {
+  /// The directory where segments are stored.
+  dir: PathBuf,
+
+  /// Path to the .checkpoint file, where information about the latest checkpoint is stored in
+  /// this format : <segment ID>:<entry LSN>.
+  /// When empty, it indicates that there are no checkpoints.
+  checkpoint_file_path: PathBuf,
+
+  /// Maximum byte size a segment can grow to.
+  max_segment_size: SegmentSize,
+
+  /// Maximum number of segments there can be.
+  max_segment_count: usize,
+
+  /// ID of the oldest segment.
+  /// Lower the segment ID, older it is.
+  oldest_segment_id: SegmentID,
+
+  /// ID of the active segment, i.e., the segment to which entries will currently be appended.
+  active_segment_id: SegmentID,
+
+  /// Buffered writer to the active segment, used for appending entries.
+  active_segment_appender: BufWriter<File>,
+
+  /// LSN of the next entry to be appended.
+  next_entry_lsn: u32
 }
 
 impl WAL {
